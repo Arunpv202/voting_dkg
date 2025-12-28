@@ -5,6 +5,7 @@ const Candidate = db.Candidate;
 const Wallet = db.Wallet;
 const ElectionCrypto = db.ElectionCrypto;
 const MerkleTreeService = require('../utils/merkleTree');
+const dkgController = require('./dkgController');
 
 // Helper for Auto Merkle Root Generation
 const generateMerkleRoot = async (election_id) => {
@@ -49,12 +50,15 @@ const generateMerkleRoot = async (election_id) => {
             threshold,
             authority_numbers: authorityCount, // Keep actual count for reference
             polynomial_degree,
-            status: 'round1'
+            status: 'setup'
         });
+
+        // Trigger Round 1 (Status update + Timer)
+        await dkgController.triggerRound1(election_id);
 
         console.log(`Merkle Root generated for ${election_id}: ${root}`);
         console.log(`Election Crypto params set: Auth=${authorityCount}, Thresh=${threshold}, Deg=${polynomial_degree}`);
-    
+
     } catch (error) {
         console.error(`Error generating Merkle Root for ${election_id}:`, error);
     }
@@ -88,7 +92,7 @@ exports.createElection = async (req, res) => {
 
 exports.setupElection = async (req, res) => {
     try {
-        const { election_id, candidates, start_time, end_time, result_time, authorities} = req.body;
+        const { election_id, candidates, start_time, end_time, result_time, authorities } = req.body;
 
         const election = await Election.findByPk(election_id);
         if (!election) return res.status(404).json({ message: 'Election not found' });

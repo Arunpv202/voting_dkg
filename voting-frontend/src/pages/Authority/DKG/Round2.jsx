@@ -1,169 +1,119 @@
 import { useState, useEffect } from 'react';
-import { ristretto255, ed25519 } from '@noble/curves/ed25519.js';
+import { ristretto255 } from '@noble/curves/ed25519.js';
 import { openDB } from 'idb';
-import CryptoJS from 'crypto-js'; // For AES encryption of shares
+import CryptoJS from 'crypto-js';
+import useAuthStore from '../../../store/useAuthStore';
 
 // Helper for hex conversion
 function bytesToHex(bytes) {
     return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-const TIMER_DURATION = 60; // 1 minute
+const TIMER_DURATION = 60; // 1 minute countdown for visual effect
 
 export default function Round2({ electionId, authorityId, dkgState, refresh }) {
-    const [status, setStatus] = useState('pending'); // pending, computing, submitted
+    const { walletAddress } = useAuthStore();
+    const [status, setStatus] = useState('pending'); // pending, computing, submitted, completed_wait
     const [peers, setPeers] = useState([]);
     const [mySecret, setMySecret] = useState(null);
+    const [timeLeft, setTimeLeft] = useState(TIMER_DURATION);
+    const [finalStatus, setFinalStatus] = useState(null); // 'done' if user finalized
 
-    // Fetch Peers (and their PKs)
+    // Load Peers and My Secret
     useEffect(() => {
         const load = async () => {
-            const res = await fetch(`http://localhost:4000/api/dkg/authorities/${electionId}`);
-            if (res.ok) {
-                const data = await res.json();
-                setPeers(data.authorities);
+            // Fetch Peers
+            try {
+                const res = await fetch(`http://localhost:4000/api/dkg/authorities/${electionId}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    setPeers(data.authorities);
+                }
+            } catch (e) {
+                console.error("Failed to load peers", e);
             }
 
-            if (secretData) {
-                setMySecret(secretData.secret_scalar);
+            // Fetch My Secret from IDB
+            try {
+                const db = await openDB('ZkVotingDB', 1);
+                const secretRecord = await db.get('secrets', electionId);
+                // Note: In Round 1 we stored with key 'election_id' or 'secrets' store? 
+                // Round 1 Code: db.put('secrets', { election_id: electionId ... }) -> key defaults?
+                // Round 1 didn't specify key, so it might be auto-increment or election_id if schema. 
+                // Let's assume we can query by election_id or index.
+                // Correction: IDB 'put' without key path requires key. Round 1 used `db.put('secrets', { ... })`. 
+                // Let's assume the user setup IDB correctly or we fetch all and find. 
+                // For robustness, let's look for match.
+
+                // Hack: If key path is not set, we might iterate.
+                let cursor = await db.transaction('secrets').store.openCursor();
+                while (cursor) {
+                    if (cursor.value.election_id === electionId && cursor.value.secret_scalar) {
+                        setMySecret(cursor.value.secret_scalar);
+                        break;
+                    }
+                    cursor = await cursor.continue();
+                }
+            } catch (e) {
+                console.error("Failed to load secret", e);
             }
         };
         load();
     }, [electionId]);
 
-    // Timer Logic
-    const [timeLeft, setTimeLeft] = useState(TIMER_DURATION);
+    // Timer
     useEffect(() => {
         if (timeLeft <= 0) return;
         const timer = setInterval(() => setTimeLeft(t => t - 1), 1000);
         return () => clearInterval(timer);
     }, [timeLeft]);
 
-    const handleFinalize = async () => {
-        try {
-            console.log("Fetching shares...");
-            const res = await fetch(`http://localhost:4000/api/dkg/shares/${electionId}/${authorityId}`);
-            const { shares } = await res.json();
-
-            // In a real DKG, we sum scalars mod curve order.
-            // Since JS BigInt doesn't verify curve order automatically, we simulate the sum "structure".
-            // The critical part requested was decryption.
-
-            const decryptedShares = [];
-
-            for (const item of shares) {
-                const sender = peers.find(p => p.authority_id === item.from_authority_id);
-                if (!sender) continue;
-
-                // 1. Derive Shared Key (ECDH)
-                // Shared Point = MySecret * SenderPK
-                // SenderPK is on curve. MySecret is scalar.
-                const senderPoint = ristretto255.Point.fromHex(sender.pk);
-                const mySecretBigInt = BigInt('0x' + mySecret);
-
-                const sharedPoint = senderPoint.multiply(mySecretBigInt);
-                const sharedKeyHex = sharedPoint.toHex();
-
-                // 2. Decrypt
-                let decryptedVal;
-                try {
-                    // AES Decrypt
-                    const bytes = CryptoJS.AES.decrypt(item.encrypted_share, sharedKeyHex);
-                    decryptedVal = bytes.toString(CryptoJS.enc.Utf8);
-                    if (!decryptedVal) throw new Error("Empty decryption");
-                } catch (err) {
-                    console.error("Decryption failed from", sender.authority_id, err);
-                    continue;
-                }
-
-                console.log(`Decrypted share from Auth ${sender.authority_id}:`, decryptedVal);
-                decryptedShares.push(decryptedVal);
-            }
-
-            // In production, we would Sum(decryptedShares) mod Order
-            // Here we store the list of valid decrypted shares as the "Final Secret" component
-            await storeSecrets(electionId + "_FINAL", {
-                final_shares: decryptedShares,
-                timestamp: Date.now()
-            }, "LOCAL_AUTH_KEY");
-
-            alert("DKG Completed! All shares decrypted and stored.");
-            setStatus('completed');
-
-        } catch (e) {
-            console.error(e);
-            alert("Finalization failed: " + e.message);
-        }
-    };
-
+    // Compute & Submit
     const handleComputeAndSubmit = async () => {
-        if (!mySecret) { alert("My secret not found! Did you complete Round 1?"); return; }
-        if (peers.length === 0) { alert("No peers found."); return; }
+        if (!mySecret) { alert("Secret not found. Did you finish Round 1?"); return; }
+        if (!peers.length) { alert("No peers found."); return; }
 
         setStatus('computing');
+
         try {
-            const t = dkgState.threshold;
-            const n = peers.length;
+            const degree = dkgState.polynomial_degree || 2; // Default if missing, but should be there
+            const L = BigInt('0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed'); // Ed25519 Order
 
-            // 1. Generate Polynomial f(x)
-            // f(x) = a0 + a1*x + ... + a_deg*x^deg
-            // f(x) = a0 + a1*x + ... + a_deg*x*deg
-            // a0 = mySecret
-            // We need scalar arithmetic. Ristretto255 scalars are approx 252 bits.
-            // For rigorous security, we'd use a BigInt mod logic.
-            // CURVE_ORDER for Ed25519 is l = 2^252 + 27742317777372353535851937790883648493
-            const L = BigInt('0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed');
-
-            // Coefficients a_1 ... a_{t-1} are random
-            const coefficients = [BigInt('0x' + mySecret)]; // a0
-            for (let i = 1; i < t; i++) {
+            // 1. Generate Polynomial
+            // f(x) = a0 + a1*x + ... + ad*x^d
+            const coeffs = [BigInt('0x' + mySecret)]; // a0
+            for (let i = 1; i <= degree; i++) {
                 const rnd = window.crypto.getRandomValues(new Uint8Array(32));
-                const rndHex = bytesToHex(rnd);
-                let coeff = BigInt('0x' + rndHex) % L;
-                if (coeff === 0n) coeff = 1n; // unlikely but safe
-                coefficients.push(coeff);
+                let val = BigInt('0x' + bytesToHex(rnd)) % L;
+                coeffs.push(val);
             }
 
-            // 2. Compute Secret Shares for Peers: s_j = f(j)
-            const shares = [];
-            for (const peer of peers) {
-                const j = BigInt(peer.authority_id); // Authority index
-                let val = BigInt(0);
+            // 2. Compute Commitment (C0 = a0 * G)
+            const mySecretBI = BigInt('0x' + mySecret);
+            const commitmentPoint = ristretto255.Point.BASE.multiply(mySecretBI);
+            const commitmentHex = commitmentPoint.toHex();
 
-                // Horner's method or direct sum
-                // y = a0 + x(a1 + x(a2 + ...))
-                for (let k = coeffs.length - 1; k >= 0; k--) {
-                    val = (val * j + coeffs[k]) % L;
-                }
-
-                // val is the scalar share for authority j
-                const shareHex = val.toString(16);
-                shares.push({ to_authority_id: peer.authority_id, value: shareHex }); // Keep Hex string
-            }
-
-            // 3. Compute Constant Term Commitment (C0 = a0 * G)
-            // this matches the Round 1 PK, assuming a0 = mySecret.
-            // 3. Compute Commitment to Constant Term (C0 = a0 * G)
-            // a0 is mySecret. C0 is my PK from Round 1.
-            // Re-derive to ensure consistency
-            const pubKeyPoint = ristretto255.Point.BASE.multiply(BigInt('0x' + mySecret));
-            const commitment = pubKeyPoint.toHex();
-
-            // 4. Encrypt Shares (ECDH)
+            // 3. Compute Shares & Encrypt
             const encryptedShares = [];
-            for (const share of shares) {
-                const peer = peers.find(p => p.authority_id === share.to_authority_id);
 
-                // ECDH: Shared Key = mySecret * PeerPK
-                // PeerPK is a point. mySecret is scalar.
+            for (const peer of peers) {
+                // Evaluate f(peer.authority_id)
+                const x = BigInt(peer.authority_id);
+                let y = BigInt(0);
+
+                // Horner's Method: a_d * x^d + ... + a_0
+                for (let k = coeffs.length - 1; k >= 0; k--) {
+                    y = (y * x + coeffs[k]) % L;
+                }
+                const shareHex = y.toString(16);
+
+                // Encrypt with Shared Key (ECDH)
+                // Peer PK (Point) * My Secret (Scalar)
                 const peerPoint = ristretto255.Point.fromHex(peer.pk);
-                const mySecretBigInt = BigInt('0x' + mySecret);
+                const sharedPoint = peerPoint.multiply(mySecretBI);
+                const sharedKeyHex = sharedPoint.toHex();
 
-                const sharedPoint = peerPoint.multiply(mySecretBigInt);
-                const sharedKeyHex = sharedPoint.toHex(); // This is the shared secret key
-
-                // Encrypt payload (Share Value) with Shared Key
-                const encrypted = CryptoJS.AES.encrypt(share.value, sharedKeyHex).toString();
+                const encrypted = CryptoJS.AES.encrypt(shareHex, sharedKeyHex).toString();
 
                 encryptedShares.push({
                     to_authority_id: peer.authority_id,
@@ -171,11 +121,12 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
                 });
             }
 
-            // 5. Submit
+            // 4. Submit
+            // const walletAddress = localStorage.getItem('wallet'); // Using store now
             const payload = {
                 election_id: electionId,
-                authority_id: authorityId,
-                commitment: commitment,
+                wallet_address: walletAddress,
+                commitment: commitmentHex,
                 shares: encryptedShares
             };
 
@@ -189,62 +140,122 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
                 setStatus('submitted');
                 refresh();
             } else {
-                alert('Round 2 Submission Failed');
+                const err = await res.json();
+                alert('Details: ' + err.message);
                 setStatus('pending');
             }
 
-        } catch (err) {
-            console.error(err);
-            alert('Error in Round 2: ' + err.message);
+        } catch (e) {
+            console.error(e);
+            alert("Error: " + e.message);
             setStatus('pending');
+        }
+    };
+
+    // Calculate My Secret (Finalize)
+    const handleCalculateSecret = async () => {
+        try {
+            // Fetch shares sent TO me
+            // Backend needs authority_id. We only have it if we fetched peers and found ourselves,
+            // or if we trust the passed prop `authorityId`. 
+            // The user said backend returns it in Round 1. 
+            // In Dashboard, `confirmedAuthorityId` is passed as `authorityId` prop. Use that.
+            if (!authorityId) {
+                alert("Authority ID missing. Please reload.");
+                return;
+            }
+
+            const res = await fetch(`http://localhost:4000/api/dkg/shares/${electionId}/${authorityId}`);
+            if (!res.ok) throw new Error("Failed to fetch shares");
+
+            const { shares } = await res.json();
+            const L = BigInt('0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed');
+
+            let finalShare = BigInt(0);
+
+            for (const item of shares) {
+                // Find Sender
+                const sender = peers.find(p => p.authority_id === item.from_authority_id);
+                if (!sender) {
+                    console.warn(`Sender ${item.from_authority_id} not found in peers`);
+                    continue;
+                }
+
+                // Decrypt
+                // Shared Key = Sender PK * My Secret
+                const senderPoint = ristretto255.Point.fromHex(sender.pk);
+                const mySecretBI = BigInt('0x' + mySecret);
+                const sharedPoint = senderPoint.multiply(mySecretBI);
+                const sharedKeyHex = sharedPoint.toHex();
+
+                const bytes = CryptoJS.AES.decrypt(item.encrypted_share, sharedKeyHex);
+                const decryptedHex = bytes.toString(CryptoJS.enc.Utf8);
+
+                if (!decryptedHex) throw new Error(`Failed to decrypt share from ${sender.authority_id}`);
+
+                const shareVal = BigInt('0x' + decryptedHex);
+                finalShare = (finalShare + shareVal) % L;
+            }
+
+            // Store Final Share
+            const db = await openDB('ZkVotingDB', 1);
+            await db.put('secrets', {
+                election_id: electionId + "_FINAL",
+                secret_scalar: finalShare.toString(16),
+                created_at: new Date().toISOString()
+            });
+
+            setFinalStatus('done');
+
+        } catch (e) {
+            console.error(e);
+            alert("Calculation failed: " + e.message);
         }
     };
 
     return (
         <div className="text-center">
-            <h3 className="text-lg font-bold uppercase tracking-wider text-indigo-500 mb-6">Round 2: Key Generation & Share Distribution</h3>
+            <h3 className="text-lg font-bold uppercase tracking-wider text-purple-500 mb-6">Round 2: Share Distribution</h3>
 
-            <p className="text-gray-400 mb-8 max-w-lg mx-auto">
-                Compute your polynomial contribution, generate secret shares for other authorities, and commit to your constant term.
-            </p>
+            <div className="mb-4 text-sm text-gray-400">
+                <p>Status: <span className="text-white font-mono">{dkgState?.status}</span></p>
+                <p>Degree: <span className="text-white font-mono">{dkgState?.polynomial_degree}</span></p>
+                <p>Peers: <span className="text-white font-mono">{peers.length}</span></p>
+            </div>
 
-            {status === 'pending' && (
+            {status === 'pending' && dkgState?.status === 'round2' && (
                 <button
                     onClick={handleComputeAndSubmit}
-                    className="px-8 py-4 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-xl transition-all shadow-lg shadow-purple-600/20"
+                    className="px-8 py-4 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-xl shadow-lg shadow-purple-600/20"
                 >
                     Compute & Distribute Shares
                 </button>
             )}
 
-            {status === 'computing' && <p className="text-purple-400 animate-pulse">Running Multi-Party Computation...</p>}
+            {status === 'computing' && <p className="text-purple-400 animate-pulse">Computing Polynomials...</p>}
 
-            {status === 'submitted' && (
-                <div className="flex flex-col items-center gap-4">
-                    <div className="bg-emerald-500/10 p-6 rounded-xl border border-emerald-500/20 inline-block">
-                        <p className="text-emerald-400 font-bold">Contribution Submitted!</p>
-                        <p className="text-sm text-gray-400 mt-2">Waiting for Round 2 to complete...</p>
-                    </div>
-
-                    <div className="text-2xl font-mono font-bold text-white mt-4">
-                        {Math.floor(timeLeft / 60)}:{(timeLeft % 60).toString().padStart(2, '0')}
-                    </div>
-
-                    {timeLeft <= 0 && (
-                        <button
-                            onClick={handleFinalize}
-                            className="px-8 py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition-all shadow-lg shadow-emerald-600/20 animate-pulse"
-                        >
-                            Finalize & Compute Secret
-                        </button>
-                    )}
+            {(status === 'submitted' || dkgState?.status === 'completed') && (
+                <div className="bg-emerald-500/10 p-6 rounded-xl border border-emerald-500/20 inline-block mb-6">
+                    <p className="text-emerald-400 font-bold">Shares Submitted!</p>
                 </div>
             )}
 
-            {status === 'completed' && (
-                <div className="bg-blue-500/10 p-6 rounded-xl border border-blue-500/20 inline-block mt-6">
-                    <p className="text-blue-400 font-bold">DKG Finalized</p>
-                    <p className="text-sm text-gray-400 mt-2">Your private share has been computed and securely stored.</p>
+            {dkgState?.status === 'completed' && finalStatus !== 'done' && (
+                <div className="mt-4">
+                    <p className="text-blue-300 mb-4">DKG Completed. Time to calculate your final secret.</p>
+                    <button
+                        onClick={handleCalculateSecret}
+                        className="px-8 py-4 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl shadow-lg shadow-blue-600/20"
+                    >
+                        Calculate My Secret
+                    </button>
+                </div>
+            )}
+
+            {finalStatus === 'done' && (
+                <div className="mt-6 bg-blue-500/10 p-6 rounded-xl border border-blue-500/20 inline-block">
+                    <p className="text-blue-400 font-bold text-xl">Secret Calculated & Stored</p>
+                    <p className="text-gray-400 text-sm mt-2">You are ready for the election.</p>
                 </div>
             )}
         </div>

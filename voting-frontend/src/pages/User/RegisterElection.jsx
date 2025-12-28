@@ -14,8 +14,13 @@ import {
   Loader2
 } from "lucide-react";
 
+import useAuthStore from "../../store/useAuthStore";
+// ... imports
+
 export default function RegisterElection() {
   const navigate = useNavigate();
+  const { walletAddress } = useAuthStore();
+
   const [formData, setFormData] = useState({
     election_id: "",
     token: ""
@@ -27,18 +32,31 @@ export default function RegisterElection() {
   };
 
   const handleRegister = async () => {
-    if (!formData.election_id || !formData.token) {
-      alert("Please fill all fields");
-      return;
-    }
+    // ... validation
 
     setLoading(true);
     try {
-      // 1. Connect to MetaMask
       if (!window.ethereum) throw new Error("MetaMask not found");
       const provider = new ethers.BrowserProvider(window.ethereum);
+
+      // Get the currently active account in MetaMask
+      const accounts = await window.ethereum.request({ method: "eth_accounts" });
+      const activeAccount = accounts[0];
+
+      if (!activeAccount || !walletAddress) {
+        throw new Error("Wallet not connected properly.");
+      }
+
+      // Check mismatch
+      if (activeAccount.toLowerCase() !== walletAddress.toLowerCase()) {
+        // Try to request switch (requires user action in MM)
+        // EIP-1102: eth_requestAccounts will prompt selection/switch if not already authorized
+        // But effectively, we just want to tell the user they are on the wrong account.
+        throw new Error(`MetaMask is set to ${activeAccount.slice(0, 6)}... but you logged in as ${walletAddress.slice(0, 6)}... Please switch accounts in MetaMask.`);
+      }
+
       const signer = await provider.getSigner();
-      const address = await signer.getAddress(); // Ensure connected
+      // ... logic continues ...
 
       // 2. Generate ZK Identity
       const zkSecret = CryptoJS.lib.WordArray.random(32).toString();

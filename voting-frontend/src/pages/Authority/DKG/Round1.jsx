@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { ristretto255, ed25519 } from '@noble/curves/ed25519.js';
 import { openDB } from 'idb';
+import useAuthStore from '../../../store/useAuthStore';
+import { initDB } from '../../../utils/zkStorage';
 
 
 
@@ -10,9 +12,10 @@ function bytesToHex(bytes) {
     return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-export default function Round1({ electionId, authorityId, dkgState, refresh }) {
+export default function Round1({ electionId, dkgState, refresh }) {
     const [status, setStatus] = useState('pending'); // pending, generating, submitted
     const [pk, setPk] = useState('');
+    const { walletAddress } = useAuthStore();
 
     const handleGenerateAndSubmit = async () => {
         setStatus('generating');
@@ -42,7 +45,9 @@ export default function Round1({ electionId, authorityId, dkgState, refresh }) {
             // 2. Store Secret Locally
             // Using IndexedDB wrapper defined in zkStorage.js or inline here for simplicity
             // For this phase, let's just store simple IDB
-            const db = await openDB('ZkVotingDB', 1);
+            // 2. Store Secret Locally
+            // Use shared initDB to ensure 'secrets' store exists
+            const db = await initDB();
             await db.put('secrets', {
                 election_id: electionId,
                 secret_scalar: validSecretHex, // Store the reduced scalar
@@ -56,17 +61,22 @@ export default function Round1({ electionId, authorityId, dkgState, refresh }) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     election_id: electionId,
-                    authority_id: authorityId,
+                    wallet_address: walletAddress,
                     pk: pkHex
                 })
             });
 
             if (res.ok) {
+                const data = await res.json();
+                console.log('Authority ID returned:', data.authority_id);
+                // Optionally store it for next steps
+
                 setPk(pkHex);
                 setStatus('submitted');
                 refresh();
             } else {
-                alert('Submission failed');
+                const errorData = await res.json();
+                alert(`Submission failed: ${errorData.message}`);
                 setStatus('pending');
             }
         } catch (err) {
