@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+import { createJSONStorage } from 'zustand/middleware';
+
 const useAuthStore = create(
     persist(
         (set) => ({
@@ -17,7 +19,8 @@ const useAuthStore = create(
             clearAuth: () => set({ walletAddress: null, authorityId: null, role: null, electionId: null }),
         }),
         {
-            name: 'auth-storage', // unique name for localStorage
+            name: 'auth-storage', // unique name
+            storage: createJSONStorage(() => sessionStorage), // Use Session Storage for Tab Isolation
         }
     )
 );

@@ -2,20 +2,35 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import { ArrowLeft, Shield, Loader2, Key } from "lucide-react";
+import useAuthStore from "../../store/useAuthStore";
 
 export default function EnterDKG() {
     const navigate = useNavigate();
-    const [electionId, setElectionId] = useState("");
+    const [inputElectionId, setInputElectionId] = useState("");
     const [loading, setLoading] = useState(false);
 
-    const handleEnter = () => {
-        if (!electionId) return;
+    const { setElectionId } = useAuthStore();
+
+    const handleEnter = async () => {
+        if (!inputElectionId) return;
         setLoading(true);
-        // Simulate loading for better UX
-        setTimeout(() => {
+
+        try {
+            // Validate Election ID against backend
+            const res = await fetch(`http://localhost:4000/api/elections/${inputElectionId}`);
+            if (res.ok) {
+                // If valid, store properly in Auth Store
+                setElectionId(inputElectionId);
+                navigate(`/authority/dkg/${inputElectionId}`);
+            } else {
+                alert("Invalid Election ID. Please check and try again.");
+            }
+        } catch (error) {
+            console.error(error);
+            alert("Connection error. Please try again.");
+        } finally {
             setLoading(false);
-            navigate(`/authority/dkg/${electionId}`);
-        }, 800);
+        }
     };
 
     return (
@@ -55,8 +70,8 @@ export default function EnterDKG() {
                             </label>
                             <input
                                 type="text"
-                                value={electionId}
-                                onChange={(e) => setElectionId(e.target.value)}
+                                value={inputElectionId}
+                                onChange={(e) => setInputElectionId(e.target.value)}
                                 placeholder="Enter Election ID"
                                 className="w-full bg-black/40 border border-white/10 rounded-xl py-4 px-6 outline-none focus:border-red-500/50 focus:ring-1 focus:ring-red-500/20 transition-all placeholder:text-gray-700 font-medium font-mono text-center tracking-widest text-lg"
                             />
@@ -64,7 +79,7 @@ export default function EnterDKG() {
 
                         <button
                             onClick={handleEnter}
-                            disabled={loading || !electionId}
+                            disabled={loading || !inputElectionId}
                             className="w-full mt-4 py-4 bg-red-600 hover:bg-red-500 text-white font-bold rounded-2xl shadow-lg shadow-red-600/20 transition-all active:scale-[0.98] flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                             {loading ? <Loader2 className="animate-spin" /> : <span>Start DKG Process</span>}

@@ -38,7 +38,7 @@ export default function ElectionSetup() {
 
   const handleAddAuthority = () => {
     if (newAuthority.wallet_address) {
-      setAuthorities([...authorities, newAuthority]);
+      setAuthorities([...authorities, { ...newAuthority, wallet_address: newAuthority.wallet_address.trim() }]);
       setNewAuthority({ name: "", wallet_address: "" });
     }
   };

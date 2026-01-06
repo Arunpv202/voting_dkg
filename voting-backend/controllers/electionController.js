@@ -120,13 +120,13 @@ exports.setupElection = async (req, res) => {
                     });
 
                     if (existingWallet) {
-                        // If Admin (ID 1), skip
+                        // If Admin (ID 1), skip and warn
                         if (existingWallet.role === 'admin') {
-                            console.log(`Debug: Wallet ${auth.wallet_address} is Admin (ID 1). Skipping creation.`);
+                            console.warn(`[Constraint Violation] Wallet ${auth.wallet_address} is Admin. Cannot be Authority.`);
                             continue;
                         }
 
-                        // Check if already Authority
+                        // Check if already Authority (prevent duplicates)
                         const existingAuthRole = await Wallet.findOne({
                             where: {
                                 wallet_address: auth.wallet_address,
@@ -240,6 +240,17 @@ exports.getMerkleWitness = async (req, res) => {
         const proof = merkleService.getProof(commitment);
 
         res.json({ proof });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+exports.getElection = async (req, res) => {
+    try {
+        const { election_id } = req.params;
+        const election = await Election.findByPk(election_id);
+        if (!election) return res.status(404).json({ message: 'Election not found' });
+        res.json(election);
     } catch (error) {
         res.status(500).json({ message: error.message });
     }

@@ -42,20 +42,15 @@ export default function ConnectWallet() {
 
   useEffect(() => {
     // Listen for account changes
+    // Disabled for multi-tab testing to prevent state bleeding
+    /*
     if (window.ethereum) {
-      window.ethereum.on('accountsChanged', (accounts) => {
-        if (accounts.length > 0) {
-          setAccount(accounts[0]);
-          localStorage.setItem("wallet", accounts[0]);
-          setWalletAddress(accounts[0]);
-        } else {
-          setAccount("");
-          setWalletAddress(null);
-        }
-      });
+      // Listener disabled for testing
     }
+    */
 
     if (account) {
+      setWalletAddress(account); // Store globally
       const timer = setTimeout(() => {
         if (role === "admin") navigate("/admin/dashboard");
         else navigate("/user/dashboard");
@@ -74,7 +69,7 @@ export default function ConnectWallet() {
       </div>
 
       {/* Decorative Grid */}
-      <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 brightness-100 contrast-150"></div>
+      < div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 brightness-100 contrast-150" ></div >
 
       <motion.div
         initial={{ opacity: 0, scale: 0.9 }}
@@ -188,6 +183,6 @@ export default function ConnectWallet() {
           </div>
         </div>
       </motion.div>
-    </div>
+    </div >
   );
 }

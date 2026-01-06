@@ -78,6 +78,19 @@ exports.registerVoter = async (req, res) => {
         await registration.save();
 
         if (wallet_address) {
+            // Check if already registered as voter for this election
+            const existingVoter = await Wallet.findOne({
+                where: {
+                    wallet_address,
+                    election_id,
+                    role: 'voter'
+                }
+            });
+
+            if (existingVoter) {
+                return res.status(400).json({ message: 'This wallet is already registered as a voter for this election.' });
+            }
+
             await Wallet.create({
                 wallet_address,
                 election_id,

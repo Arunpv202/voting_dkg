@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
 import { ristretto255, ed25519 } from '@noble/curves/ed25519.js';
-import { openDB } from 'idb';
 import useAuthStore from '../../../store/useAuthStore';
 import { initDB } from '../../../utils/zkStorage';
 
@@ -15,7 +14,14 @@ function bytesToHex(bytes) {
 export default function Round1({ electionId, dkgState, refresh }) {
     const [status, setStatus] = useState('pending'); // pending, generating, submitted
     const [pk, setPk] = useState('');
-    const { walletAddress } = useAuthStore();
+
+    // Access store values directly
+    const walletAddress = useAuthStore((state) => state.walletAddress);
+    const storeElectionId = useAuthStore((state) => state.electionId);
+
+    // Prioritize store value as per user instruction
+    const activeElectionId = storeElectionId || electionId;
+
 
     const handleGenerateAndSubmit = async () => {
         setStatus('generating');
@@ -42,27 +48,53 @@ export default function Round1({ electionId, dkgState, refresh }) {
             const pubKeyPoint = ristretto255.Point.BASE.multiply(secretScalar);
             const pkHex = pubKeyPoint.toHex();
 
-            // 2. Store Secret Locally
-            // Using IndexedDB wrapper defined in zkStorage.js or inline here for simplicity
-            // For this phase, let's just store simple IDB
+            // --- GENERATE SCHNORR ZKP (Proof of Knowledge of SK) ---
+            // 1. Generate Random Nonce 'r'
+            const rBytes = window.crypto.getRandomValues(new Uint8Array(32));
+            const rScalar = BigInt('0x' + bytesToHex(rBytes)) % CURVE_ORDER;
+            const R_point = ristretto255.Point.BASE.multiply(rScalar);
+            const R_Hex = R_point.toHex();
+
+            // 2. Compute Challenge c = Hash(pk || R || electionId)
+            // Ideally use extensive hashing, here we match backend concatenation
+            const challengeInput = pkHex + R_Hex + activeElectionId;
+            const encoder = new TextEncoder();
+            const challengeBuffer = await window.crypto.subtle.digest('SHA-256', encoder.encode(challengeInput));
+            const cScalar = BigInt('0x' + bytesToHex(new Uint8Array(challengeBuffer))) % CURVE_ORDER;
+
+            // 3. Compute Response s = r + c * sk
+            const sScalar = (rScalar + (cScalar * secretScalar)) % CURVE_ORDER;
+            const sHex = sScalar.toString(16).padStart(64, '0');
+
+            const proof = {
+                R: R_Hex,
+                s: sHex
+            };
+
             // 2. Store Secret Locally
             // Use shared initDB to ensure 'secrets' store exists
             const db = await initDB();
+            // KEY CHANGE: Use composite key [electionId]_[walletAddress] for isolation
+            const secretKey = `${activeElectionId}_${walletAddress}`;
+
             await db.put('secrets', {
-                election_id: electionId,
+                election_id: secretKey, // Using the composite key as the primary key if schema allows, or simple string key
                 secret_scalar: validSecretHex, // Store the reduced scalar
                 public_key: pkHex,
                 created_at: new Date().toISOString()
             });
+            console.log('Stored secret with key:', secretKey);
+
 
             // 3. Submit PK to Backend
             const res = await fetch('http://localhost:4000/api/dkg/round1/submit', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    election_id: electionId,
+                    election_id: activeElectionId,
                     wallet_address: walletAddress,
-                    pk: pkHex
+                    pk: pkHex,
+                    proof: proof // Include ZKP
                 })
             });
 
@@ -76,7 +108,8 @@ export default function Round1({ electionId, dkgState, refresh }) {
                 refresh();
             } else {
                 const errorData = await res.json();
-                alert(`Submission failed: ${errorData.message}`);
+                console.error('Backend Error Response:', { status: res.status, data: errorData });
+                alert(`Submission failed (${res.status}): ${errorData.message}`);
                 setStatus('pending');
             }
         } catch (err) {
@@ -106,7 +139,6 @@ export default function Round1({ electionId, dkgState, refresh }) {
             {status === 'submitted' && (
                 <div className="bg-emerald-500/10 p-6 rounded-xl border border-emerald-500/20 inline-block">
                     <p className="text-emerald-400 font-bold mb-2">Public Key Submitted Successfully!</p>
-                    <p className="text-xs font-mono text-gray-500 break-all max-w-sm">{pk}</p>
                     <p className="text-sm text-gray-400 mt-4">Waiting for other authorities to finish...</p>
                 </div>
             )}

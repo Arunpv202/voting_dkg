@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import { ristretto255 } from '@noble/curves/ed25519.js';
 import { openDB } from 'idb';
-import CryptoJS from 'crypto-js';
 import useAuthStore from '../../../store/useAuthStore';
 
 // Helper for hex conversion
@@ -22,44 +21,58 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
     // Load Peers and My Secret
     useEffect(() => {
         const load = async () => {
-            // Fetch Peers
+            if (!walletAddress) return;
+
+            // 1. Fetch Round 2 Data (My ID + Peers)
             try {
-                const res = await fetch(`http://localhost:4000/api/dkg/authorities/${electionId}`);
+                const res = await fetch('http://localhost:4000/api/dkg/round2/init', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ election_id: electionId, wallet_address: walletAddress })
+                });
+
                 if (res.ok) {
                     const data = await res.json();
-                    setPeers(data.authorities);
+                    setPeers(data.peers);
+                    // Use returned authority ID for local logic if needed, 
+                    // though prop authorityId is also passed. 
+                    // User wanted backend to return it.
+                    console.log("Round 2 Init: My ID =", data.authority_id);
+                } else {
+                    const err = await res.json();
+                    console.error("Round 2 Init Failed:", err.message);
+                    // If not active, maybe alert?
+                    // alert(err.message); 
                 }
             } catch (e) {
-                console.error("Failed to load peers", e);
+                console.error("Failed to init Round 2", e);
             }
 
-            // Fetch My Secret from IDB
+            // 2. Fetch My Secret from IDB
             try {
                 const db = await openDB('ZkVotingDB', 1);
-                const secretRecord = await db.get('secrets', electionId);
-                // Note: In Round 1 we stored with key 'election_id' or 'secrets' store? 
-                // Round 1 Code: db.put('secrets', { election_id: electionId ... }) -> key defaults?
-                // Round 1 didn't specify key, so it might be auto-increment or election_id if schema. 
-                // Let's assume we can query by election_id or index.
-                // Correction: IDB 'put' without key path requires key. Round 1 used `db.put('secrets', { ... })`. 
-                // Let's assume the user setup IDB correctly or we fetch all and find. 
-                // For robustness, let's look for match.
+                // KEY CHANGE: Look up using composite key
+                const secretKey = `${electionId}_${walletAddress}`;
+                const secretRecord = await db.get('secrets', secretKey);
+                console.log("Loaded secret record from IDB:", secretRecord);
 
-                // Hack: If key path is not set, we might iterate.
-                let cursor = await db.transaction('secrets').store.openCursor();
-                while (cursor) {
-                    if (cursor.value.election_id === electionId && cursor.value.secret_scalar) {
-                        setMySecret(cursor.value.secret_scalar);
-                        break;
-                    }
-                    cursor = await cursor.continue();
+                if (secretRecord && secretRecord.secret_scalar) {
+                    setMySecret(secretRecord.secret_scalar);
+                } else {
+                    // Fallback/Legacy check
+                    // If fresh setup, this shouldn't rely on legacy
+                    // But for robustness we can warn or check simple key
+                    console.warn(`Secret not found for key ${secretKey}`);
+                    // Try simple electionID key just in case (e.g. legacy/single tab flow)
+                    const legacy = await db.get('secrets', electionId);
+                    if (legacy && legacy.secret_scalar) setMySecret(legacy.secret_scalar);
                 }
             } catch (e) {
                 console.error("Failed to load secret", e);
             }
         };
         load();
-    }, [electionId]);
+    }, [electionId, walletAddress]);
 
     // Timer
     useEffect(() => {
@@ -88,36 +101,65 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
                 coeffs.push(val);
             }
 
-            // 2. Compute Commitment (C0 = a0 * G)
+            // 2. Compute Commitments (C_k = a_k * G)
+            // Need to commit to ALL coefficients for VSS
+            const commitments = coeffs.map(coeff => {
+                const point = ristretto255.Point.BASE.multiply(coeff);
+                return point.toHex();
+            });
+            const myCommitmentC0 = commitments[0]; // For local reference if needed
+
+            // RESTORED: Needed for Encryption (Share derivation)
             const mySecretBI = BigInt('0x' + mySecret);
-            const commitmentPoint = ristretto255.Point.BASE.multiply(mySecretBI);
-            const commitmentHex = commitmentPoint.toHex();
 
             // 3. Compute Shares & Encrypt
             const encryptedShares = [];
 
-            for (const peer of peers) {
-                // Evaluate f(peer.authority_id)
-                const x = BigInt(peer.authority_id);
+            // We must include OURSELVES in the distribution for the math to work.
+            // Check if peers includes us (it usually excludes self).
+            // We construct a target list including self.
+            const myPkPoint = ristretto255.Point.BASE.multiply(mySecretBI);
+            const myPkHex = myPkPoint.toHex();
+            const mySelfObj = { authority_id: authorityId, pk: myPkHex };
+
+            const allTargets = [...peers];
+            if (!allTargets.find(p => p.authority_id === authorityId)) {
+                allTargets.push(mySelfObj);
+            }
+
+            for (const target of allTargets) {
+                // Evaluate f(target.authority_id)
+                const x = BigInt(target.authority_id);
                 let y = BigInt(0);
 
                 // Horner's Method: a_d * x^d + ... + a_0
                 for (let k = coeffs.length - 1; k >= 0; k--) {
                     y = (y * x + coeffs[k]) % L;
                 }
-                const shareHex = y.toString(16);
+                const shareScalar = y;
 
-                // Encrypt with Shared Key (ECDH)
-                // Peer PK (Point) * My Secret (Scalar)
-                const peerPoint = ristretto255.Point.fromHex(peer.pk);
-                const sharedPoint = peerPoint.multiply(mySecretBI);
-                const sharedKeyHex = sharedPoint.toHex();
+                // Encrypt with Shared Key (Scalar Masking)
+                // Shared Point = Target PK * My Secret
+                const targetPoint = ristretto255.Point.fromHex(target.pk);
+                const sharedPoint = targetPoint.multiply(mySecretBI);
 
-                const encrypted = CryptoJS.AES.encrypt(shareHex, sharedKeyHex).toString();
+                // Derive Mask: Hash(SharedPoint) -> scalar
+                // Use .toHex() as .toRawBytes() is undefined in this version
+                const sharedHex = sharedPoint.toHex();
+                // Convert Hex to Uint8Array for Hashing
+                const sharedBytes = new Uint8Array(sharedHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+
+                const hashBuffer = await window.crypto.subtle.digest('SHA-256', sharedBytes);
+                const maskHex = bytesToHex(new Uint8Array(hashBuffer));
+                const mask = BigInt('0x' + maskHex) % L;
+
+                // Encrypt: (Share + Mask) % L
+                const encryptedVal = (shareScalar + mask) % L;
+                const encryptedHex = encryptedVal.toString(16).padStart(64, '0');
 
                 encryptedShares.push({
-                    to_authority_id: peer.authority_id,
-                    encrypted_share: encrypted
+                    to_authority_id: target.authority_id,
+                    encrypted_share: encryptedHex
                 });
             }
 
@@ -126,7 +168,7 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
             const payload = {
                 election_id: electionId,
                 wallet_address: walletAddress,
-                commitment: commitmentHex,
+                commitments: commitments, // VSS Requires full vector
                 shares: encryptedShares
             };
 
@@ -156,10 +198,6 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
     const handleCalculateSecret = async () => {
         try {
             // Fetch shares sent TO me
-            // Backend needs authority_id. We only have it if we fetched peers and found ourselves,
-            // or if we trust the passed prop `authorityId`. 
-            // The user said backend returns it in Round 1. 
-            // In Dashboard, `confirmedAuthorityId` is passed as `authorityId` prop. Use that.
             if (!authorityId) {
                 alert("Authority ID missing. Please reload.");
                 return;
@@ -173,11 +211,19 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
 
             let finalShare = BigInt(0);
 
+            // We need to look up senders. Peers list only has others.
+            // We must add ourselves to look up our own self-share.
+            const myPkPoint = ristretto255.Point.BASE.multiply(BigInt('0x' + mySecret));
+            const myPkHex = myPkPoint.toHex();
+            const mySelfObj = { authority_id: authorityId, pk: myPkHex };
+
+            const allLookups = [...peers, mySelfObj];
+
             for (const item of shares) {
                 // Find Sender
-                const sender = peers.find(p => p.authority_id === item.from_authority_id);
+                const sender = allLookups.find(p => p.authority_id === item.from_authority_id);
                 if (!sender) {
-                    console.warn(`Sender ${item.from_authority_id} not found in peers`);
+                    console.warn(`Sender ${item.from_authority_id} not found in known authorities`);
                     continue;
                 }
 
@@ -186,21 +232,31 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
                 const senderPoint = ristretto255.Point.fromHex(sender.pk);
                 const mySecretBI = BigInt('0x' + mySecret);
                 const sharedPoint = senderPoint.multiply(mySecretBI);
-                const sharedKeyHex = sharedPoint.toHex();
 
-                const bytes = CryptoJS.AES.decrypt(item.encrypted_share, sharedKeyHex);
-                const decryptedHex = bytes.toString(CryptoJS.enc.Utf8);
+                // Regenerate Mask
+                const sharedHex = sharedPoint.toHex();
+                const sharedBytes = new Uint8Array(sharedHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
 
-                if (!decryptedHex) throw new Error(`Failed to decrypt share from ${sender.authority_id}`);
+                const hashBuffer = await window.crypto.subtle.digest('SHA-256', sharedBytes);
+                const maskHex = bytesToHex(new Uint8Array(hashBuffer));
+                const mask = BigInt('0x' + maskHex) % L;
 
-                const shareVal = BigInt('0x' + decryptedHex);
-                finalShare = (finalShare + shareVal) % L;
+                // Decrypt: (Encrypted - Mask) % L
+                // Handle negative modulo correctly
+                const encryptedVal = BigInt('0x' + item.encrypted_share);
+                let decryptedVal = (encryptedVal - mask) % L;
+                if (decryptedVal < 0n) decryptedVal += L;
+
+                finalShare = (finalShare + decryptedVal) % L;
             }
 
             // Store Final Share
             const db = await openDB('ZkVotingDB', 1);
+            // KEY CHANGE: Unique key for final secret
+            const finalKey = `${electionId}_FINAL_${walletAddress}`;
+
             await db.put('secrets', {
-                election_id: electionId + "_FINAL",
+                election_id: finalKey,
                 secret_scalar: finalShare.toString(16),
                 created_at: new Date().toISOString()
             });
