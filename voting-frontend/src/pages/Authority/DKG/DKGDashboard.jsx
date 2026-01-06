@@ -1,13 +1,15 @@
 
 import { useState, useEffect } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom';
 import Round1 from './Round1';
 import Round2 from './Round2';
+import AdminDKGPanel from './AdminDKGPanel';
 import useAuthStore from '../../../store/useAuthStore';
 
 export default function DKGDashboard() {
     const { electionId } = useParams();
-    const { walletAddress } = useAuthStore();
+    const { walletAddress, role } = useAuthStore();
+    const navigate = useNavigate();
     const [status, setStatus] = useState('loading');
     const [dkgState, setDkgState] = useState(null);
     const [view, setView] = useState('buttons'); // 'buttons', 'round1', 'round2'
@@ -58,13 +60,10 @@ export default function DKGDashboard() {
         }, 3000);
         return () => clearInterval(interval);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [electionId, walletAddress]); // Removed derivedAuthorityId to avoid infinite loop
+    }, [electionId, walletAddress]);
 
     const handleRound1Click = () => {
         if (status === 'setup' || status === 'round1' || status === 'round2' || status === 'completed') {
-            // User can view Round 1 anytime it's active or passed, technically. 
-            // But per requirement "check status is round1". 
-            // We'll be lenient: allow entering if started.
             setView('round1');
         } else {
             alert('Round 1 is not active yet.');
@@ -106,89 +105,159 @@ export default function DKGDashboard() {
     );
 
     return (
-        <div className="min-h-screen bg-[#020617] text-white p-6">
-            <div className="max-w-4xl mx-auto">
-                <div className="flex justify-between items-center mb-8">
-                    <h1 className="text-3xl font-bold">DKG Dashboard</h1>
-                    {view !== 'buttons' && (
-                        <button
-                            onClick={handleBack}
-                            className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors"
-                        >
-                            ← Back
-                        </button>
-                    )}
-                </div>
+        <div className="min-h-screen bg-[#020617] text-white overflow-hidden">
+            {/* Top Bar for Mobile or Branding */}
+            <div className="border-b border-white/10 bg-slate-900/50 backdrop-blur-md p-4 flex justify-between items-center lg:hidden">
+                <h1 className="text-xl font-bold">DKG Dashboard</h1>
+                <span className="text-xs px-2 py-1 bg-white/10 rounded">{status}</span>
+            </div>
 
-                <div className="mb-6 text-center">
-                    <p className="text-gray-400 text-sm">Election ID: <span className="font-mono text-indigo-400">{electionId}</span></p>
-                    <p className="text-gray-500 text-xs mt-1">Status: {status}</p>
-                </div>
+            <div className="flex h-screen overflow-hidden">
 
-                <div className="bg-slate-900/50 border border-white/10 rounded-2xl p-8 shadow-xl min-h-[500px]">
+                {/* SIDEBAR NAVIGATION */}
+                <div className="hidden lg:flex flex-col w-80 bg-slate-900/80 border-r border-white/5 backdrop-blur-xl p-6 relative">
+                    <div className="mb-10">
+                        <h1 className="text-2xl font-black bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-purple-400">
+                            DKG Protocol
+                        </h1>
+                        <p className="text-xs text-gray-500 mt-2 font-mono">Election ID: {electionId}</p>
+                    </div>
 
-                    {/* VIEW 1: BUTTONS */}
-                    {view === 'buttons' && (
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                            {/* Round 1 */}
-                            <button
-                                onClick={handleRound1Click}
-                                className={`group relative p-10 rounded-2xl border-2 text-left transition-all transform hover:scale-105 ${isRound1Active
-                                    ? 'bg-gradient-to-br from-indigo-900/40 to-slate-900/80 border-indigo-500/60 hover:border-indigo-400 hover:shadow-2xl hover:shadow-indigo-500/30 cursor-pointer'
-                                    : 'bg-slate-900/30 border-gray-700/30 opacity-60'
-                                    }`}
-                            >
-                                <div className="absolute top-4 right-4">
-                                    {status === 'round1' && <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse shadow-lg shadow-green-500/50" />}
-                                </div>
-                                <h2 className="text-3xl font-black mb-3 text-white group-hover:text-indigo-300">Round 1</h2>
-                                <p className="text-sm text-indigo-400 font-mono mb-4 uppercase tracking-wider">Key Commitments</p>
-                                <p className="text-xs text-gray-400 leading-relaxed">
-                                    Generate your secret scalar and submit your public key commitment to participate in the distributed key generation ceremony.
-                                </p>
-                            </button>
+                    <nav className="flex-1 space-y-4">
+                        {role === 'admin' && (
+                            <NavButton
+                                active={view === 'admin'}
+                                onClick={() => setView('admin')}
+                                title="Control Panel"
+                                subtitle="Admin Controls"
+                                status="active"
+                            />
+                        )}
+                        <NavButton
+                            active={view === 'round1'}
+                            onClick={() => handleRound1Click()}
+                            title="Round 1"
+                            subtitle="Key Gen"
+                            status={isRound1Active ? 'active' : 'inactive'}
+                        />
+                        <NavButton
+                            active={view === 'round2'}
+                            onClick={() => handleRound2Click()}
+                            title="Round 2"
+                            subtitle="Distribution"
+                            status={isRound2Active ? 'active' : 'inactive'}
+                        />
+                    </nav>
 
-                            {/* Round 2 */}
-                            <button
-                                onClick={handleRound2Click}
-                                className={`group relative p-10 rounded-2xl border-2 text-left transition-all transform hover:scale-105 ${isRound2Active
-                                    ? 'bg-gradient-to-br from-purple-900/40 to-slate-900/80 border-purple-500/60 hover:border-purple-400 hover:shadow-2xl hover:shadow-purple-500/30 cursor-pointer'
-                                    : 'bg-slate-900/30 border-gray-700/30 opacity-60' // not disabled, just dimmed, click handles alert
-                                    }`}
-                            >
-                                <div className="absolute top-4 right-4">
-                                    {status === 'round2' && <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse shadow-lg shadow-green-500/50" />}
-                                </div>
-                                <h2 className="text-3xl font-black mb-3 text-white group-hover:text-purple-300">Round 2</h2>
-                                <p className="text-sm text-purple-400 font-mono mb-4 uppercase tracking-wider">Share Distribution</p>
-                                <p className="text-xs text-gray-400 leading-relaxed">
-                                    Compute polynomial shares, encrypt them using ECDH, and securely distribute to other authorities.
-                                </p>
-                            </button>
+                    <div className="mt-auto pt-6 border-t border-white/5">
+                        <div className="p-4 rounded-xl bg-white/5 border border-white/5">
+                            <p className="text-xs text-gray-400 uppercase tracking-wider mb-2 font-bold">Protocol Status</p>
+                            <div className="flex items-center gap-2">
+                                <div className={`w-2 h-2 rounded-full ${status === 'error' ? 'bg-red-500' : 'bg-green-500 animate-pulse'}`} />
+                                <span className="font-mono text-sm font-bold text-white capitalize">{status}</span>
+                            </div>
                         </div>
-                    )}
+                        <div className="flex flex-col gap-2 mt-4">
+                            {/* Context-aware Exit Buttons */}
+                            {role === 'admin' ? (
+                                <button
+                                    onClick={() => navigate('/admin/dashboard')}
+                                    className="w-full py-2 px-4 rounded-lg bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 text-xs font-bold transition-all text-left flex items-center gap-2"
+                                >
+                                    <span>←</span> Admin Dashboard
+                                </button>
+                            ) : (
+                                <button
+                                    onClick={() => navigate('/user/dashboard')}
+                                    className="w-full py-2 px-4 rounded-lg bg-slate-700/30 hover:bg-slate-700/50 text-slate-400 hover:text-white text-xs font-bold transition-all text-left flex items-center gap-2"
+                                >
+                                    <span>←</span> User Dashboard
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                </div>
 
-                    {/* VIEW 2: ROUND 1 */}
-                    {view === 'round1' && (
-                        <Round1
-                            electionId={electionId}
-                            dkgState={dkgState}
-                            refresh={fetchStatus}
-                        />
-                    )}
+                {/* MAIN CONTENT AREA */}
+                <div className="flex-1 overflow-y-auto p-4 lg:p-8 relative scrollbar-hide">
+                    <div className="max-w-6xl mx-auto space-y-8">
 
-                    {/* VIEW 3: ROUND 2 */}
-                    {view === 'round2' && (
-                        <Round2
-                            electionId={electionId}
-                            authorityId={derivedAuthorityId}
-                            dkgState={dkgState}
-                            refresh={fetchStatus}
-                        />
-                    )}
+                        {/* Dynamic Content View */}
+                        <div className="min-h-[600px] transition-all duration-500">
+                            {view === 'buttons' && (
+                                <div className="flex flex-col items-center justify-center h-full text-center py-20 opacity-50">
+                                    <div className="p-6 rounded-full bg-white/5 mb-4">
+                                        <div className="w-12 h-12 border-2 border-dashed border-gray-600 rounded-full animate-spin-slow" />
+                                    </div>
+                                    <h3 className="text-xl font-bold text-gray-500">Select a Round</h3>
+                                    <p className="text-gray-600">Use the sidebar to navigate protocol rounds.</p>
+                                </div>
+                            )}
 
+                            {view === 'admin' && role === 'admin' && (
+                                <div className="animate-slideDown">
+                                    <AdminDKGPanel electionId={electionId} />
+                                </div>
+                            )}
+
+                            {view === 'round1' && (
+                                <div className="animate-fadeIn">
+                                    <h2 className="text-3xl font-bold mb-6 flex items-center gap-3">
+                                        <span className="text-indigo-400">01.</span> Round 1
+                                    </h2>
+                                    <div className="bg-slate-900/50 border border-white/10 rounded-2xl p-8 shadow-xl">
+                                        <Round1
+                                            electionId={electionId}
+                                            dkgState={dkgState}
+                                            refresh={fetchStatus}
+                                        />
+                                    </div>
+                                </div>
+                            )}
+
+                            {view === 'round2' && (
+                                <div className="animate-fadeIn">
+                                    <h2 className="text-3xl font-bold mb-6 flex items-center gap-3">
+                                        <span className="text-purple-400">02.</span> Round 2
+                                    </h2>
+                                    <div className="bg-slate-900/50 border border-white/10 rounded-2xl p-8 shadow-xl">
+                                        <Round2
+                                            electionId={electionId}
+                                            authorityId={derivedAuthorityId}
+                                            dkgState={dkgState}
+                                            refresh={fetchStatus}
+                                        />
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
+    );
+}
+
+// Sidebar Button Component
+function NavButton({ active, onClick, title, subtitle, status }) {
+    return (
+        <button
+            onClick={onClick}
+            className={`w-full text-left p-4 rounded-xl transition-all duration-300 group border relative overflow-hidden ${active
+                ? 'bg-gradient-to-r from-indigo-600/20 to-purple-600/20 border-indigo-500/50 shadow-lg'
+                : 'bg-transparent border-transparent hover:bg-white/5 hover:border-white/5'
+                }`}
+        >
+            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000" />
+            <div className="relative z-10">
+                <div className={`text-lg font-bold mb-1 ${active ? 'text-white' : 'text-gray-400 group-hover:text-gray-200'}`}>
+                    {title}
+                </div>
+                <div className="flex justify-between items-center">
+                    <span className="text-xs text-gray-500 font-mono uppercase tracking-wider">{subtitle}</span>
+                    {status === 'active' && <div className="w-2 h-2 bg-emerald-500 rounded-full shadow-[0_0_8px_rgba(16,185,129,0.5)]" />}
+                </div>
+            </div>
+        </button>
     );
 }

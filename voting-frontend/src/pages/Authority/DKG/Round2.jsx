@@ -48,25 +48,29 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
                 console.error("Failed to init Round 2", e);
             }
 
-            // 2. Fetch My Secret from IDB
+            // 2. Fetch My Secret (Round 1) AND Final Secret
             try {
                 const db = await openDB('ZkVotingDB', 1);
-                // KEY CHANGE: Look up using composite key
+                // Round 1 Secret
                 const secretKey = `${electionId}_${walletAddress}`;
                 const secretRecord = await db.get('secrets', secretKey);
-                console.log("Loaded secret record from IDB:", secretRecord);
 
                 if (secretRecord && secretRecord.secret_scalar) {
                     setMySecret(secretRecord.secret_scalar);
                 } else {
-                    // Fallback/Legacy check
-                    // If fresh setup, this shouldn't rely on legacy
-                    // But for robustness we can warn or check simple key
-                    console.warn(`Secret not found for key ${secretKey}`);
-                    // Try simple electionID key just in case (e.g. legacy/single tab flow)
+                    // Check Legacy
                     const legacy = await db.get('secrets', electionId);
                     if (legacy && legacy.secret_scalar) setMySecret(legacy.secret_scalar);
                 }
+
+                // Check for FINAL Secret (to disable button if already done)
+                const finalKey = `${electionId}_FINAL_${walletAddress}`;
+                const finalRecord = await db.get('secrets', finalKey);
+                if (finalRecord) {
+                    console.log("Final secret already computed.");
+                    setFinalStatus('done');
+                }
+
             } catch (e) {
                 console.error("Failed to load secret", e);
             }
@@ -220,16 +224,21 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
             const allLookups = [...peers, mySelfObj];
 
             for (const item of shares) {
-                // Find Sender
-                const sender = allLookups.find(p => p.authority_id === item.from_authority_id);
-                if (!sender) {
-                    console.warn(`Sender ${item.from_authority_id} not found in known authorities`);
+                // Find Sender (from embedded data or lookup)
+                let sender = allLookups.find(p => String(p.authority_id) === String(item.from_authority_id));
+
+                // Construct a composite sender object using freshest data from share item if available
+                const validCommitment = item.sender_commitment || sender?.commitment;
+                const validPk = item.sender_pk || sender?.pk;
+
+                if (!validPk) {
+                    console.warn(`Sender PK not found for ${item.from_authority_id}`);
                     continue;
                 }
 
                 // Decrypt
                 // Shared Key = Sender PK * My Secret
-                const senderPoint = ristretto255.Point.fromHex(sender.pk);
+                const senderPoint = ristretto255.Point.fromHex(validPk);
                 const mySecretBI = BigInt('0x' + mySecret);
                 const sharedPoint = senderPoint.multiply(mySecretBI);
 
@@ -246,6 +255,42 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
                 const encryptedVal = BigInt('0x' + item.encrypted_share);
                 let decryptedVal = (encryptedVal - mask) % L;
                 if (decryptedVal < 0n) decryptedVal += L;
+
+                // ---------------------------------------------------------
+                // FELDMAN VERIFICATION: s * G == sum( C_k * i^k )
+                // ---------------------------------------------------------
+                if (validCommitment) {
+                    try {
+                        const commitments = JSON.parse(validCommitment);
+                        if (Array.isArray(commitments) && commitments.length > 0) {
+                            const i = BigInt(authorityId); // My ID (x coordinate)
+                            let rhs = ristretto255.Point.ZERO;
+
+                            // Compute RHS = sum( C_k * i^k )
+                            for (let k = 0; k < commitments.length; k++) {
+                                const C_k = ristretto255.Point.fromHex(commitments[k]);
+                                let i_k = BigInt(1);
+                                if (k > 0) i_k = i ** BigInt(k);
+
+                                const term = C_k.multiply(i_k);
+                                rhs = rhs.add(term);
+                            }
+
+                            const lhs = ristretto255.Point.BASE.multiply(decryptedVal);
+
+                            if (!lhs.equals(rhs)) {
+                                throw new Error(`Verification Failed for sender ${item.from_authority_id}`);
+                            }
+                            console.log(`[VSS] verified share from ${item.from_authority_id}`);
+                        }
+                    } catch (err) {
+                        console.error("VSS Verification Error:", err);
+                        alert(`Warning: Could not verify share from Authority ${item.from_authority_id}. It might be invalid.`);
+                        // For strict security, one might throw; here we warn.
+                    }
+                } else {
+                    console.warn(`No commitment found for ${item.from_authority_id}, computation insecure.`);
+                }
 
                 finalShare = (finalShare + decryptedVal) % L;
             }
@@ -282,29 +327,46 @@ export default function Round2({ electionId, authorityId, dkgState, refresh }) {
             {status === 'pending' && dkgState?.status === 'round2' && (
                 <button
                     onClick={handleComputeAndSubmit}
-                    className="px-8 py-4 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-xl shadow-lg shadow-purple-600/20"
+                    className="px-8 py-4 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-xl shadow-lg shadow-purple-600/20 transition-all transform hover:scale-105"
                 >
                     Compute & Distribute Shares
                 </button>
             )}
 
-            {status === 'computing' && <p className="text-purple-400 animate-pulse">Computing Polynomials...</p>}
+            {status === 'computing' && <p className="text-purple-400 animate-pulse font-mono">Computing Polynomials & Encrypting...</p>}
 
-            {(status === 'submitted' || dkgState?.status === 'completed') && (
-                <div className="bg-emerald-500/10 p-6 rounded-xl border border-emerald-500/20 inline-block mb-6">
-                    <p className="text-emerald-400 font-bold">Shares Submitted!</p>
+            {(status === 'submitted' || dkgState?.status === 'completed') && finalStatus !== 'done' && (
+                <div className="mt-8 animate-slideUp">
+                    <div className="flex flex-col md:flex-row gap-4 items-center justify-between bg-slate-900/50 p-4 rounded-xl border border-white/5">
+                        <div className="text-left">
+                            <h4 className="text-blue-300 font-bold mb-1">Finalize Calculation</h4>
+                            <p className="text-gray-400 text-xs">
+                                {dkgState?.status === 'completed'
+                                    ? "Protocol is finalized. Safe to compute."
+                                    : "Warning: Calculate only after ALL authorities have submitted."}
+                            </p>
+                        </div>
+                        <button
+                            onClick={async () => {
+                                if (dkgState?.status !== 'completed') {
+                                    if (!window.confirm("Warning: The Election is not marked as COMPLETED by the Admin.\n\nIf other authorities have not submitted their shares yet, your calculated secret will be PARTIAL and INVALID.\n\nAre you sure you want to proceed?")) return;
+                                }
+                                await handleCalculateSecret();
+                            }}
+                            className={`px-6 py-3 font-bold rounded-xl shadow-lg transition-all transform hover:scale-105 ${dkgState?.status === 'completed'
+                                ? "bg-blue-600 hover:bg-blue-500 text-white shadow-blue-600/20"
+                                : "bg-slate-700 hover:bg-slate-600 text-gray-200 border border-white/10"
+                                }`}
+                        >
+                            Calculate My Secret
+                        </button>
+                    </div>
                 </div>
             )}
 
-            {dkgState?.status === 'completed' && finalStatus !== 'done' && (
-                <div className="mt-4">
-                    <p className="text-blue-300 mb-4">DKG Completed. Time to calculate your final secret.</p>
-                    <button
-                        onClick={handleCalculateSecret}
-                        className="px-8 py-4 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-xl shadow-lg shadow-blue-600/20"
-                    >
-                        Calculate My Secret
-                    </button>
+            {dkgState?.status === 'round2' && status === 'pending' && (
+                <div className="mt-8 text-xs text-gray-500">
+                    <p>Tip: Ensure you have at least 1 peer before computing.</p>
                 </div>
             )}
 

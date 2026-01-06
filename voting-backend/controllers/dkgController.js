@@ -11,29 +11,58 @@ async function getRistretto() {
 }
 
 // Schnorr Verification Helper
+// Schnorr Verification Helper
+// Protocol: s * G = R + c * PK
+// c = H(DomSep || R || PK || M)
+// Schnorr Verification Helper
+// Protocol: s * G = R + c * PK
+// c = H(DomSep || R || PK || M)
 async function verifySchnorr(pkHex, proof, electionId) {
     if (!proof || !proof.R || !proof.s) return false;
     const { R, s } = proof;
     const ristretto255 = await getRistretto();
 
     try {
-        // Reconstruct Challenge c = Hash(pk || R || electionId)
-        const challengeInput =
-            pkHex + R + String(electionId);
-
-        const hash = crypto.createHash('sha256').update(challengeInput).digest();
-        const L = BigInt('0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed');
-        const c = BigInt('0x' + hash.toString('hex')) % L;
-
-        // Verify: s*G == R + c*PK
-        const sG = ristretto255.Point.BASE.multiply(BigInt('0x' + s));
+        // Validate Hex Inputs
+        if (!/^[0-9a-fA-F]{64}$/.test(pkHex) || !/^[0-9a-fA-F]{64}$/.test(R) || !/^[0-9a-fA-F]{64}$/.test(s)) {
+            console.warn("Invalid Hex Format in ZKP");
+            return false;
+        }
 
         const R_point = ristretto255.Point.fromHex(R);
         const P_point = ristretto255.Point.fromHex(pkHex);
+
+        // Domain Separated Challenge
+        const hash = crypto.createHash('sha256');
+        hash.update('Voting_Schnorr_Proof_v1'); // Domain Separation Tag
+        hash.update(Buffer.from(R, 'hex'));
+        hash.update(Buffer.from(pkHex, 'hex'));
+        hash.update(Buffer.from(String(electionId)));
+
+        const digest = hash.digest();
+
+        // FIX: Hardcoded Group Order for Ristretto255 (same as Ed25519 scalar field)
+        const L = BigInt('0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed');
+
+        const c_hex = digest.toString('hex');
+        const c = BigInt('0x' + c_hex) % L;
+
+        // Verify: s*G == R + c*PK
+        const sG = ristretto255.Point.BASE.multiply(BigInt('0x' + s));
         const cP = P_point.multiply(c);
         const RHS = R_point.add(cP);
 
-        return sG.equals(RHS);
+        const result = sG.equals(RHS);
+        if (!result) {
+            console.log("[ZKP Debug] Verification Failed:");
+            console.log("  PK:", pkHex);
+            console.log("  ElectionID:", electionId);
+            console.log("  Computed Challenge (c):", c.toString(16));
+            console.log("  LHS (s*G):", sG.toHex());
+            console.log("  RHS (R+c*P):", RHS.toHex());
+        }
+        return result;
+
     } catch (e) {
         console.error("ZKP Verify Error:", e);
         return false;
@@ -54,20 +83,27 @@ const triggerRound2 = async (election_id) => {
     }
 };
 
-// Exported helper to start Round 1 (called by electionController)
-exports.triggerRound1 = async (election_id) => {
+// Exported helper to trigger Round 1
+// Supports dual signature: (election_id) OR (req, res)
+exports.triggerRound1 = async (arg1, res) => {
+    let election_id;
+    let isHttp = false;
+
     try {
+        if (arg1 && arg1.body && arg1.body.election_id) {
+            election_id = arg1.body.election_id;
+            isHttp = true;
+        } else if (typeof arg1 === 'string' || typeof arg1 === 'number') {
+            election_id = arg1;
+        } else {
+            throw new Error('Invalid arguments to triggerRound1');
+        }
+
         console.log(`[DKG] Triggering Round 1 for Election ${election_id}`);
         const now = new Date();
         const threeMinutes = 3 * 60 * 1000;
         const endTime = new Date(now.getTime() + threeMinutes);
 
-        // Update ElectionCrypto status
-        /* 
-           Note: We assume the ElectionCrypto record might already exist 
-           or needs to be created. upsert is safest if we aren't sure.
-           However, commonly it might be created here or just updated.
-        */
         const [crypto, created] = await ElectionCrypto.upsert({
             election_id,
             status: 'round1',
@@ -77,18 +113,15 @@ exports.triggerRound1 = async (election_id) => {
 
         console.log(`[DKG] Round 1 started. Ends at ${endTime.toISOString()}`);
 
-        // Set 3-minute timer for checking/transitioning to Round 2
-        // Note: This timer lives in memory. If server restarts, this might be lost 
-        // unless we have a startup check. For now, we implement the memory timer as requested.
-        // User requested to remove time constraints for testing.
-        /*
-        setTimeout(() => {
-            triggerRound2(election_id);
-        }, threeMinutes);
-        */
+        if (isHttp && res) {
+            res.json({ message: 'Round 1 Triggered successfully' });
+        }
 
     } catch (error) {
         console.error(`[DKG] Error triggering Round 1 for ${election_id}:`, error);
+        if (isHttp && res) {
+            res.status(500).json({ message: error.message });
+        }
     }
 };
 
@@ -112,77 +145,67 @@ exports.getDkgStatus = async (req, res) => {
     }
 };
 
+exports.triggerRound2 = async (req, res) => {
+    try {
+        const { election_id } = req.body;
+        const crypto = await ElectionCrypto.findByPk(election_id);
+        if (!crypto) return res.status(404).json({ message: 'Election not found' });
+
+        crypto.status = 'round2';
+        // crypto.round1_end_time = new Date(); // Update timestamps if tracking
+        await crypto.save();
+        res.json({ message: 'Round 2 manually triggered' });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
 exports.submitPublicKey = async (req, res) => {
     try {
         const { election_id, wallet_address, pk, proof } = req.body;
 
+        // 1. Basic Validation
+        if (!election_id || !wallet_address || !pk || !proof) {
+            return res.status(400).json({ message: 'Missing required fields' });
+        }
+        if (!/^[0-9a-fA-F]{64}$/.test(pk)) {
+            return res.status(400).json({ message: 'Invalid Public Key Format' });
+        }
+
         const crypto = await ElectionCrypto.findByPk(election_id);
         if (!crypto) return res.status(404).json({ message: 'Election Crypto not found' });
 
-        // Strict check disabled for testing flexibility as per user request
-        /*
-        if (crypto.status !== 'round1') {
-            return res.status(400).json({ message: `Round 1 is not active. Current status: ${crypto.status}` });
-        }
-        */
+        // 2. Lookup Authority (Using findAll workaround for safety)
+        const allRoles = await Wallet.findAll({
+            where: { election_id, wallet_address: wallet_address.trim() } // Ensure trimmed
+        });
+        const authority = allRoles.find(w => w.role === 'authority' || w.role === 'admin');
 
-        const now = new Date();
-        // User requested to remove time constraints
-        /*
-        if (crypto.round1_end_time && now > crypto.round1_end_time) {
-            return res.status(400).json({ message: 'Round 1 time has expired' });
-        }
-        */
-
-        if (!wallet_address) {
-            return res.status(400).json({ message: 'Wallet address is required' });
+        if (!authority) {
+            return res.status(403).json({ message: 'Authority wallet not found in election roster.' });
         }
 
-        // Verify ZKP
+        // 3. Prevent Duplicate Submission Logic
+        if (authority.pk && authority.pk !== pk) {
+            return res.status(409).json({ message: 'A different Public Key is already registered for this authority.' });
+        }
+        if (authority.pk === pk) {
+            // Idempotent success
+            return res.json({ message: 'Public Key already submitted', authority_id: authority.authority_id });
+        }
+
+        // 4. Verify ZKP
         const isValid = await verifySchnorr(pk, proof, election_id);
         if (!isValid) {
             console.warn(`[DKG] Invalid ZKP for ${wallet_address} in election ${election_id}`);
-            return res.status(400).json({ message: 'Invalid Zero-Knowledge Proof. You verify as the owner of this key.' });
+            return res.status(400).json({ message: 'Zero-Knowledge Proof Verification Failed.' });
         }
 
-        console.log(`[DKG Debug] submitPublicKey received: Election=${election_id}, Wallet=${wallet_address}`);
-
-        // Fix for Multi-Role Compoosite Keys:
-        // Fetch ALL rows for this user/election, then find the authority role in memory.
-        // This avoids Sequelize findOne ambiguity with composite keys.
-        const allRoles = await Wallet.findAll({
-            where: {
-                election_id,
-                wallet_address
-            }
-        });
-
-        const authority = allRoles.find(w => w.role === 'authority' || w.role === 'admin');
-
-        console.log(`[DKG Debug] Wallet Lookup: Found ${allRoles.length} rows. Authority Record:`, authority ? 'YES' : 'NO');
-        if (allRoles.length > 0) {
-            console.log('[DKG Debug] Roles found:', allRoles.map(r => r.role).join(', '));
-        }
-
-        console.log(`[DKG Debug] Wallet Lookup Result:`, authority ? `Found ID ${authority.authority_id}` : 'Not Found');
-
-        if (!authority) {
-            // If strictly must be authority to submit logic
-            return res.status(404).json({ message: 'Authority wallet not found' });
-        }
-
-        // CHECK: Prevent duplicate submission
-        if (authority.pk) {
-            return res.status(400).json({ message: 'You have already submitted your Public Key.' });
-        }
-
-        // ZKP Verified at start of function
-
-        // Save Public Key
-
-        // Save Public Key
+        // 5. Success - Save
         authority.pk = pk;
         await authority.save();
+
+        console.log(`[DKG] PK Submitted for AuthID ${authority.authority_id}`);
 
         res.json({
             message: 'Public key verified and submitted successfully',
@@ -190,7 +213,8 @@ exports.submitPublicKey = async (req, res) => {
         });
 
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error(error);
+        if (!res.headersSent) res.status(500).json({ message: error.message });
     }
 };
 
@@ -198,42 +222,39 @@ exports.submitRound2 = async (req, res) => {
     try {
         const { election_id, wallet_address, commitments, shares } = req.body;
 
+        // 1. Validate Inputs
+        if (!commitments || !Array.isArray(commitments) || commitments.length === 0) {
+            return res.status(400).json({ message: 'Invalid commitments. Must be a non-empty array of hex strings.' });
+        }
+        // Basic Hex Check for Commitments
+        if (!commitments.every(c => /^[0-9a-fA-F]{64}$/.test(c))) {
+            return res.status(400).json({ message: 'Commitments must be valid 32-byte hex strings.' });
+        }
+
         const crypto = await ElectionCrypto.findByPk(election_id);
         if (!crypto) return res.status(404).json({ message: 'Election not found' });
 
-        // Strict status check disabled for testing
-        /*
-        if (crypto.status !== 'round2') {
-            return res.status(400).json({ message: `Round 2 is not active. Status: ${crypto.status}` });
-        }
-        */
-
+        // 2. Auth Lookup
         const allRoles = await Wallet.findAll({
-            where: {
-                election_id,
-                wallet_address
-            }
+            where: { election_id, wallet_address: wallet_address.trim() }
         });
-        const authority = allRoles.find(w => w.role === 'authority');
+        const authority = allRoles.find(w => w.role === 'authority' || w.role === 'admin');
 
-        if (!authority) return res.status(404).json({ message: 'Authority not found or user is not an authority for this election' });
+        if (!authority) return res.status(403).json({ message: 'Authority not found' });
 
-        // Store Commitments (Feldman VSS)
-        // Input: commitments = [C0, C1, ... Ct] (Array of Hex Strings)
-        // Storage: Store as JSON string in `commitment` TEXT field
-        if (commitments && Array.isArray(commitments)) {
-            authority.commitment = JSON.stringify(commitments);
-        } else {
-            // Fallback for single commitment if legacy or minimal
-            // But for full VSS we require the array.
-            // We'll proceed but log warning.
-            console.warn("Received Round 2 submission without polynomial commitments list.");
-        }
-
+        // 3. Store Commitments and Shares
+        authority.commitment = JSON.stringify(commitments);
         await authority.save();
 
-        // Store Encrypted Shares
+        // Overwrite existing shares if re-submitting to prevent duplicates/ghost shares
         if (shares && Array.isArray(shares)) {
+            // Transactional delete + create is better, but simple approaches:
+            await EncryptedShare.destroy({
+                where: {
+                    election_id,
+                    from_authority_id: authority.authority_id
+                }
+            });
             const shareRecords = shares.map(s => ({
                 election_id,
                 from_authority_id: authority.authority_id,
@@ -243,57 +264,55 @@ exports.submitRound2 = async (req, res) => {
             await EncryptedShare.bulkCreate(shareRecords);
         }
 
-        // Check if ALL authorities have submitted commitments
+        // 4. Aggregation Check (Is Round 2 Done?)
+        // Fetch all authorities who act as key holders
         const authorities = await Wallet.findAll({
             where: {
                 election_id,
-                authority_id: { [db.Sequelize.Op.ne]: null }
+                role: { [Op.in]: ['authority', 'admin'] }
             }
         });
 
-        // Check if everyone has submitted (non-null commitment)
+        // Verify if everyone has committed
         const allCommitted = authorities.every(a => a.commitment != null);
 
-        if (allCommitted) {
-            console.log(`[DKG] All authorities committed for ${election_id}. Computing Election PK...`);
+        if (allCommitted && authorities.length > 0) {
+            console.log(`[DKG] All ${authorities.length} authorities committed. Computing Election PK...`);
 
-            // Sum C_0 from everyone to get Election PK
-            // C_0 is the first element of the stored JSON array
             const ristretto255 = await getRistretto();
             let sumPoint = ristretto255.Point.ZERO;
+            let success = true;
 
             for (const auth of authorities) {
-                let C0_Hex;
                 try {
                     const parsed = JSON.parse(auth.commitment);
-                    if (Array.isArray(parsed)) {
-                        C0_Hex = parsed[0];
-                    } else {
-                        // Legacy fallback if it was a simple string
-                        C0_Hex = auth.commitment;
-                    }
-                } catch (e) {
-                    C0_Hex = auth.commitment; // Assuming raw hex string if parse fails
-                }
-
-                if (C0_Hex) {
+                    const C0_Hex = parsed[0]; // C0 = a0*G = Public Key Share
+                    if (!C0_Hex) throw new Error("Missing C0");
                     const point = ristretto255.Point.fromHex(C0_Hex);
                     sumPoint = sumPoint.add(point);
+                } catch (e) {
+                    console.error(`[DKG] Failed to aggregate from AuthID ${auth.authority_id}:`, e);
+                    success = false; // Cannot compute valid PK if one is bad
+                    break;
                 }
             }
 
-            const electionPK = sumPoint.toHex();
-
-            crypto.election_pk = electionPK;
-            crypto.status = 'completed';
-            await crypto.save();
-            console.log(`[DKG] Election PK Computed: ${electionPK}`);
+            if (success) {
+                const electionPK = sumPoint.toHex();
+                crypto.election_pk = electionPK;
+                crypto.status = 'completed';
+                await crypto.save();
+                console.log(`[DKG] Election PK Computed: ${electionPK}`);
+            } else {
+                console.warn("[DKG] Aggregation failed due to corrupted commitment data.");
+            }
         }
 
-        res.json({ message: 'Round 2 submission successful with VSS Commitments' });
+        res.json({ message: 'Round 2 submission accepted.' });
 
     } catch (error) {
-        res.status(500).json({ message: error.message });
+        console.error(error);
+        if (!res.headersSent) res.status(500).json({ message: error.message });
     }
 };
 
@@ -305,10 +324,49 @@ exports.getShares = async (req, res) => {
             where: {
                 election_id,
                 to_authority_id: authority_id
-            }
+            },
+            raw: true
         });
 
-        res.json({ shares });
+        // Enhance shares with Sender's Commitment
+        // We fetching all authorities for this election to map commitments
+        // This is efficient enough for small N
+        const authorities = await Wallet.findAll({
+            where: { election_id, role: { [Op.in]: ['authority', 'admin'] } },
+            attributes: ['authority_id', 'commitment', 'pk']
+        });
+
+        const enhancedShares = shares.map(share => {
+            const sender = authorities.find(a => String(a.authority_id) === String(share.from_authority_id));
+            if (sender) {
+                // We fake the structure expected by frontend (which expects 'shares' but looks up 'sender' in 'peers')
+                // Actually, Frontend looks up sender in 'peers' list.
+                // BUT, if we add 'commitment' to the share object itself, we can modify Frontend to use it?
+                // The current Frontend (Round2.jsx) does: 
+                //    const sender = allLookups.find(p => p.authority_id === item.from_authority_id);
+                //    if (sender.commitment) ...
+
+                // So updating Backend here DOES NOT automatically fix Frontend unless Frontend uses this data.
+                // However, since Frontend logic is "find sender in list", we are Stuck with Stale List on Frontend.
+
+                // WAIT. I can't easily change Frontend state from here.
+                // BUT, if I update 'getShares' response...
+                // AND I update Frontend to PREFER the info from 'getShares' if available?
+                // Or I can just make 'Round2.jsx' fetch fresh peers before calc?
+
+                // Let's do BOTH.
+                // But specifically for this tool call, I will enhance the response.
+                // AND I will modify the Frontend in the next step to usage this enhanced data or refresh peers.
+                return {
+                    ...share,
+                    sender_commitment: sender.commitment,
+                    sender_pk: sender.pk
+                };
+            }
+            return share;
+        });
+
+        res.json({ shares: enhancedShares });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
@@ -339,7 +397,8 @@ exports.initRound2 = async (req, res) => {
         const crypto = await ElectionCrypto.findByPk(election_id);
         if (!crypto) return res.status(404).json({ message: 'Election not found' });
 
-        if (crypto.status !== 'round2') {
+        // Temporarily allow if completed too, to let users re-enter to see shares
+        if (crypto.status !== 'round2' && crypto.status !== 'completed') {
             return res.status(400).json({ message: `Round 2 is not active. Current status: ${crypto.status}` });
         }
 
@@ -347,10 +406,8 @@ exports.initRound2 = async (req, res) => {
         const myAuth = await Wallet.findOne({
             where: {
                 election_id,
-                wallet_address,
-                role: {
-                    [Op.in]: ['authority', 'admin']
-                }
+                wallet_address: wallet_address.trim(), // fix spaces
+                role: { [Op.in]: ['authority', 'admin'] }
             }
         });
 
@@ -362,9 +419,7 @@ exports.initRound2 = async (req, res) => {
         const peers = await Wallet.findAll({
             where: {
                 election_id,
-                role: {
-                    [Op.in]: ['authority', 'admin']
-                },
+                role: { [Op.in]: ['authority', 'admin'] },
                 authority_id: { [db.Sequelize.Op.ne]: myAuth.authority_id } // Exclude self
             },
             attributes: ['authority_id', 'pk', 'commitment'] // Return commitments for VSS
@@ -376,6 +431,106 @@ exports.initRound2 = async (req, res) => {
         });
 
     } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: error.message });
+    }
+}
+
+exports.getAdminStatus = async (req, res) => {
+    try {
+        const { election_id } = req.params;
+
+        // Fetch Election Crypto Status
+        const crypto = await ElectionCrypto.findByPk(election_id);
+
+        // Fetch all potential authorities
+        const authorities = await Wallet.findAll({
+            where: {
+                election_id,
+                role: { [db.Sequelize.Op.in]: ['authority', 'admin'] }
+            },
+            attributes: ['authority_id', 'wallet_address', 'role', 'pk', 'commitment']
+        });
+
+        const detailed = authorities.map(a => ({
+            authority_id: a.authority_id,
+            wallet_address: a.wallet_address,
+            role: a.role,
+            has_round1: !!a.pk,
+            has_round2: !!a.commitment,
+            status: (!a.pk) ? 'Pending Round 1' : (!a.commitment) ? 'Pending Round 2' : 'Completed'
+        }));
+
+        res.json({
+            authorities: detailed,
+            election_status: crypto ? crypto.status : 'unknown',
+            election_pk: crypto ? crypto.election_pk : null
+        });
+
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
+exports.computeElectionKeys = async (req, res) => {
+    try {
+        const { election_id } = req.body;
+        const crypto = await ElectionCrypto.findByPk(election_id);
+        if (!crypto) return res.status(404).json({ message: 'Election not found' });
+
+        if (crypto.status === 'completed' && crypto.election_pk) {
+            console.log(`[DKG] Already Finalized. Returning existing PK.`);
+            return res.json({ message: 'DKG Already Finalized.', election_pk: crypto.election_pk });
+        }
+
+        // Fetch all authorities
+        const authorities = await Wallet.findAll({
+            where: {
+                election_id,
+                role: { [Op.in]: ['authority', 'admin'] }
+            }
+        });
+
+        const allCommitted = authorities.every(a => a.commitment != null);
+        if (!allCommitted) {
+            return res.status(400).json({
+                message: 'Cannot finalize: Not all authorities have submitted Round 2 commitments.'
+            });
+        }
+
+        console.log(`[DKG] Manual Finalization: Computing Election PK...`);
+
+        const ristretto255 = await getRistretto();
+        let sumPoint = ristretto255.Point.ZERO;
+        let success = true;
+
+        for (const auth of authorities) {
+            try {
+                const parsed = JSON.parse(auth.commitment);
+                const C0_Hex = parsed[0];
+                if (!C0_Hex) throw new Error("Missing C0");
+                const point = ristretto255.Point.fromHex(C0_Hex);
+                sumPoint = sumPoint.add(point);
+            } catch (e) {
+                console.error(`[DKG] Failed to aggregate from AuthID ${auth.authority_id}:`, e);
+                success = false;
+                break;
+            }
+        }
+
+        if (success) {
+            const electionPK = sumPoint.toHex();
+            crypto.election_pk = electionPK;
+            crypto.status = 'completed';
+            await crypto.save();
+            console.log(`[DKG] Election PK Computed: ${electionPK}`);
+            res.json({ message: 'DKG Finalized. Election Public Key Computed.', election_pk: electionPK });
+        } else {
+            return res.status(500).json({ message: 'Aggregation failed due to corrupted commitment data.' });
+        }
+
+    } catch (error) {
+        console.error(error);
         res.status(500).json({ message: error.message });
     }
 };

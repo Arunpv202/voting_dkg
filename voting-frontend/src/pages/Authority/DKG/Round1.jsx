@@ -55,11 +55,26 @@ export default function Round1({ electionId, dkgState, refresh }) {
             const R_point = ristretto255.Point.BASE.multiply(rScalar);
             const R_Hex = R_point.toHex();
 
-            // 2. Compute Challenge c = Hash(pk || R || electionId)
-            // Ideally use extensive hashing, here we match backend concatenation
-            const challengeInput = pkHex + R_Hex + activeElectionId;
-            const encoder = new TextEncoder();
-            const challengeBuffer = await window.crypto.subtle.digest('SHA-256', encoder.encode(challengeInput));
+            // 2. Compute Challenge c = Hash(DomSep || R || pk || electionId)
+            // Backend expects: 'Voting_Schnorr_Proof_v1' || R(bytes) || PK(bytes) || ElectionID(bytes)
+
+            const hexToBytes = (hex) => new Uint8Array(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+
+            const tagBytes = new TextEncoder().encode('Voting_Schnorr_Proof_v1');
+            const rBytesForHash = hexToBytes(R_Hex); // 32 bytes
+            const pkBytesForHash = hexToBytes(pkHex); // 32 bytes
+            const idBytes = new TextEncoder().encode(String(activeElectionId));
+
+            const totalLen = tagBytes.length + rBytesForHash.length + pkBytesForHash.length + idBytes.length;
+            const concatenated = new Uint8Array(totalLen);
+
+            let offset = 0;
+            concatenated.set(tagBytes, offset); offset += tagBytes.length;
+            concatenated.set(rBytesForHash, offset); offset += rBytesForHash.length;
+            concatenated.set(pkBytesForHash, offset); offset += pkBytesForHash.length;
+            concatenated.set(idBytes, offset);
+
+            const challengeBuffer = await window.crypto.subtle.digest('SHA-256', concatenated);
             const cScalar = BigInt('0x' + bytesToHex(new Uint8Array(challengeBuffer))) % CURVE_ORDER;
 
             // 3. Compute Response s = r + c * sk
